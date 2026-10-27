@@ -1605,14 +1605,7 @@ export function shouldUseStreamingEncode(
   ).enabled;
 }
 
-/**
- * Whether a multi-worker disk plan that failed the pre-capture disk-headroom
- * gate should degrade to single-worker streaming instead of failing the
- * render. Eligibility reuses the up-front streaming decision at one worker,
- * so png-sequence/gif, the duration cap, and enableStreamingEncode=false keep
- * the gate error. Single-worker disk plans are ignored: they are on disk
- * precisely because no streaming alternative exists.
- */
+/** Single-worker disk plans stay on disk: they are there because streaming is not eligible. */
 export function shouldDegradeDiskCaptureToStreaming(args: {
   planKind: CapturePlan["kind"];
   workerCount: number;
