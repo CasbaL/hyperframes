@@ -13,6 +13,7 @@ import { createTimelineDomNodeResolver, findClipElementById } from "../lib/timel
 import { usePlayerStore } from "../store/playerStore";
 import type { TimelineElement, DomClipChild, SubCompositionHostState } from "../store/playerStore";
 import { resolveCssStackingContextId } from "@hyperframes/core/runtime/stacking-context";
+import { LOOP_INFLATED_TIMELINE_SECONDS } from "@hyperframes/core/runtime/composition-length";
 import type { ClipTree } from "@hyperframes/core/runtime/clipTree";
 import { HF_AUDIO_GROUP_ATTR } from "@hyperframes/core/audio-groups";
 import { groupInfoFor } from "../lib/timelineGroupInfo";
@@ -31,7 +32,7 @@ import { inspectStudioRuntimeMessage } from "../lib/runtimeProtocol";
 
 /** Reject non-finite, non-positive, and absurdly large (loop-inflated) values. */
 export function sanitizeDurationSeconds(value: number): number {
-  return Number.isFinite(value) && value > 0 && value < 7200 ? value : 0;
+  return Number.isFinite(value) && value > 0 && value < LOOP_INFLATED_TIMELINE_SECONDS ? value : 0;
 }
 
 /**
@@ -111,6 +112,17 @@ function collectHostDomChildren(
   }
 }
 
+type SceneMarkupWindow = Window & {
+  __hfParkedSceneMarkup?: (placeholder: Element) => Element | null;
+};
+
+/** A clip's host; for a scene the preview unmounted, the markup it mounts with. */
+function clipHostOf(iframeDoc: Document, clip: ClipManifestClip): Element | null {
+  const host = findClipElementById(iframeDoc, clip);
+  const view = iframeDoc.defaultView as SceneMarkupWindow | null;
+  return (host && view?.__hfParkedSceneMarkup?.(host)) ?? host;
+}
+
 /**
  * Every sub-composition's internal elements, across the whole manifest.
  *
@@ -128,7 +140,7 @@ export function collectSubCompositionDomChildren(
   if (!iframeDoc) return out;
   for (const clip of clips) {
     if (clip.kind !== "composition" || !clip.id) continue;
-    const hostEl = findClipElementById(iframeDoc, clip);
+    const hostEl = clipHostOf(iframeDoc, clip);
     if (!hostEl) continue;
     const innerRoot = hostEl.querySelector("[data-hf-inner-root]") ?? hostEl;
     collectHostDomChildren(clip.id, innerRoot, clip.id, parentMap, out);
@@ -172,7 +184,7 @@ export function collectSubCompositionHostState(
   if (!iframeDoc) return out;
   for (const clip of clips) {
     if (clip.kind !== "composition" || !clip.id) continue;
-    const hostEl = findClipElementById(iframeDoc, clip);
+    const hostEl = clipHostOf(iframeDoc, clip);
     if (!hostEl) continue;
     for (const el of Array.from(hostEl.querySelectorAll("[id]"))) {
       const state = readSubCompositionHostState(el);

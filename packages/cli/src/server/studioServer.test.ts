@@ -1,3 +1,7 @@
+import {
+  waitForRenderCancellation,
+  cancelAndVerifyArtifacts,
+} from "../../../../test-utils/renderCancellation";
 import { EventEmitter } from "node:events";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import {
@@ -62,6 +66,10 @@ vi.mock("../browser/gpuPolicy.js", () => ({
   resolveLocalBrowserGpuMode: () => "software",
   compositionRequiresWebGpu: () => false,
   assertWebGpuAdapterAvailable: async () => {},
+  resolveLocalWebGpu: (browserGpuMode: string) => ({
+    gpuConfig: { browserGpuMode, allowSoftwareWebGpu: false },
+    softwareWebGpu: false,
+  }),
 }));
 vi.mock("../browser/preflight.js", async (importOriginal) => ({
   ...(await importOriginal<typeof import("../browser/preflight.js")>()),
@@ -69,6 +77,22 @@ vi.mock("../browser/preflight.js", async (importOriginal) => ({
 }));
 vi.mock("../browser/manager.js", () => ({
   ensureBrowser: async () => ({ executablePath: undefined, source: "system" }),
+}));
+
+const cpuSamplerState = vi.hoisted(() => ({
+  samplers: [] as { requesterOptedIn: boolean; stopped: boolean }[],
+}));
+vi.mock("../telemetry/renderCpu.js", () => ({
+  startRenderCpuSampler: (requesterOptedIn = true) => {
+    const sampler = { requesterOptedIn, stopped: false };
+    cpuSamplerState.samplers.push(sampler);
+    return {
+      stop: () => {
+        sampler.stopped = true;
+        return { cpuBusyAvgPct: 57, cpuBusyPeakPct: 90 };
+      },
+    };
+  },
 }));
 
 // Lets one test hold the project history in its opening; every other test opens the real one.
@@ -135,8 +159,8 @@ describe("Studio thumbnail GPU capture plumbing", () => {
   it("uses the shared auto probe, resolved launch mode, requirement guard, and completion-aware seek", () => {
     const source = readFileSync(new URL("./studioServer.ts", import.meta.url), "utf8");
     expect(source).toContain("resolveCaptureBrowserGpuMode");
-    expect(source).toContain("{ browserGpuMode: resolvedGpuMode }");
-    expect(source).toContain("assertWebGpuAdapterAvailable(page, requiresWebGpu)");
+    expect(source).toContain("resolveLocalWebGpu(resolvedGpuMode, true)");
+    expect(source).toContain("requiresWebGpu && session.softwareWebGpu");
     expect(source).toContain("await seekCompositionTimeline(page, opts.seekTime");
   });
 });
@@ -184,6 +208,27 @@ describe("createStudioServer project history (D-491)", () => {
       await server.shutdown();
     },
   );
+
+  // A preview an agent starts inside a host app's run can outlive it; holding the lock, it refused every later run.
+  it("never opens the history inside a host app's run, which owns it", async () => {
+    const opens: unknown[] = [];
+    historyState.open = async (options) => {
+      opens.push(options);
+      throw new Error("the history was opened");
+    };
+    vi.stubEnv("HYPERFRAMES_DESKTOP_PROJECT", "/a/project");
+    try {
+      const projectDir = tmpProject();
+      server = createStudioServer({ projectDir, historyRoot: tmpProject() });
+      const historyUrl = `/api/projects/${encodeURIComponent(basename(projectDir))}/history`;
+      expect((await server.app.request(historyUrl)).status).toBe(404);
+      expect(opens).toEqual([]);
+      await server.shutdown();
+    } finally {
+      vi.unstubAllEnvs();
+      historyState.open = null;
+    }
+  });
 
   it("never makes a request wait on another process's history lock again once it was busy", async () => {
     const waits: unknown[] = [];
@@ -342,6 +387,91 @@ describe("createStudioServer shutdown", () => {
     const meta = JSON.parse(readFileSync(outputPath.replace(/\.mp4$/, ".meta.json"), "utf8"));
     expect(meta.audioLoweredDb).toBe(1.44);
   });
+
+  it("stops measuring CPU however a render ends, and never for an opted-out requester", async () => {
+    cpuSamplerState.samplers = [];
+    const outDir = mkdtempSync(join(tmpdir(), "hf-render-cpu-"));
+    server = createStudioServer({ projectDir: tmpProject() });
+
+    producerState.executeRenderJob = async () => {};
+    const done = server.adapter.startRender(startRenderOpts("job-done", join(outDir, "a.mp4")));
+    await vi.waitFor(() => expect(done.status, done.error).toBe("complete"), { timeout: 5_000 });
+
+    producerState.executeRenderJob = async () => {
+      throw new Error("boom");
+    };
+    const failed = server.adapter.startRender({
+      ...startRenderOpts("job-failed", join(outDir, "b.mp4")),
+      telemetryOptOut: true,
+    });
+    await vi.waitFor(() => expect(failed.status).toBe("failed"), { timeout: 5_000 });
+
+    let started!: () => void;
+    const startedPromise = new Promise<void>((resolve) => {
+      started = resolve;
+    });
+    producerState.executeRenderJob = (_job, _dir, _outputPath, _onProgress, signal) => {
+      started();
+      return new Promise((_resolve, reject) => {
+        const onAbort = () => reject(Object.assign(new Error("cancelled"), { name: "AbortError" }));
+        if (signal.aborted) onAbort();
+        else signal.addEventListener("abort", onAbort);
+      });
+    };
+    const cancelled = server.adapter.startRender(
+      startRenderOpts("job-cancelled", join(outDir, "c.mp4")),
+    );
+    await untilStarted(startedPromise, cancelled);
+    cancelled.cancel?.();
+    await vi.waitFor(() => expect(cancelled.status).toBe("cancelled"), { timeout: 5_000 });
+
+    expect(cpuSamplerState.samplers).toEqual([
+      { requesterOptedIn: true, stopped: true },
+      { requesterOptedIn: false, stopped: true },
+      { requesterOptedIn: true, stopped: true },
+    ]);
+    rmSync(outDir, { recursive: true, force: true });
+  });
+
+  it("forwards GIF loop count and writes a metadata sidecar without overwriting output", async () => {
+    producerState.executeRenderJob = async (job, _dir, outputPath) => {
+      expect(job).toMatchObject({ format: "gif", gifLoop: 3 });
+      writeFileSync(outputPath, "GIF89a");
+    };
+    const projectDir = tmpProject();
+    const outputPath = join(projectDir, "out.gif");
+    server = createStudioServer({ projectDir });
+    const state = server.adapter.startRender({
+      ...startRenderOpts("gif-job", outputPath),
+      format: "gif",
+      gifLoop: 3,
+    });
+    await vi.waitFor(() => expect(state.status, state.error).toBe("complete"));
+    expect(readFileSync(outputPath, "utf8")).toBe("GIF89a");
+    expect(JSON.parse(readFileSync(join(projectDir, "out.meta.json"), "utf8"))).toMatchObject({
+      status: "complete",
+    });
+  });
+
+  it.each([false, true])(
+    "removes cancelled GIF output and sidecar (late completion: %s)",
+    async (lateCompletion) => {
+      const projectDir = tmpProject();
+      const outputPath = join(projectDir, "out.gif");
+      const metaPath = join(projectDir, "out.meta.json");
+      producerState.executeRenderJob = async (_job, _dir, output, _progress, signal) => {
+        writeFileSync(output, "partial-gif");
+        writeFileSync(metaPath, "{}");
+        await waitForRenderCancellation(signal, lateCompletion);
+      };
+      server = createStudioServer({ projectDir });
+      const state = server.adapter.startRender({
+        ...startRenderOpts("gif-job", outputPath),
+        format: "gif",
+      });
+      await cancelAndVerifyArtifacts(state, outputPath, metaPath);
+    },
+  );
 
   it("cancels an in-flight render's signal and waits for it before draining the browser pool", async () => {
     const events: string[] = [];

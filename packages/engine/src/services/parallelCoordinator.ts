@@ -7,7 +7,8 @@
 
 import { cpus, freemem } from "os";
 import { existsSync, mkdirSync, readdirSync } from "fs";
-import { copyFile, readFile, rename } from "fs/promises";
+import { copyFile, readFile } from "fs/promises";
+import { renameWithRetryAsync } from "../utils/renameWithRetry.js";
 import { join } from "path";
 import { getHeapStatistics } from "v8";
 
@@ -78,6 +79,8 @@ export interface WorkerResult {
   perf?: CapturePerfSummary;
   error?: string;
   diagnostics?: string[];
+  /** The worker session's `[Browser:PAGEERROR]` console lines, kept so the render's error count sees them. */
+  pageErrorLines?: string[];
   failure?: CaptureFailure;
 }
 
@@ -88,6 +91,14 @@ export interface ParallelProgress {
   workerProgress: Map<number, number>;
   /** Latest lifecycle transition; absent on ordinary completed-frame updates. */
   latestWorkerPhase?: ParallelWorkerPhaseDiagnostic;
+  /** Disk capture only: the frame file this update finished writing, readable from now on. */
+  landedFrame?: LandedFrame;
+}
+
+/** A captured frame file: `index` is its file index (`frame_<index>`), `path` where it was written. */
+export interface LandedFrame {
+  index: number;
+  path: string;
 }
 
 export type ParallelWorkerPhase =
@@ -105,6 +116,7 @@ export interface ParallelWorkerPhaseDiagnostic {
   browserVersion: string;
   canvasDrawElement: boolean | "unknown";
   gpuBackend: string;
+  readStep?: () => string | undefined;
 }
 
 export interface WorkerSizingConfig extends Partial<
@@ -123,11 +135,6 @@ export interface WorkerSizingConfig extends Partial<
 
 type WorkerBrowserPoolDecision = {
   parallel?: boolean;
-  platform: NodeJS.Platform;
-  // Deliberately accepted but not used: forceScreenshot is not an exclusion.
-  forceScreenshot?: boolean;
-  deviceScaleFactor?: number;
-  headlessShellPath?: string;
 };
 
 // System-memory budget per parallel worker. Each worker is a full Chrome
@@ -165,19 +172,13 @@ function defaultSafeMaxWorkers(): number {
 }
 const MIN_FRAMES_PER_WORKER = 30;
 
-// Linux/headless parallel workers need isolated browser processes: BeginFrame
-// crashes when shared, while forceScreenshot is safe but serializes
-// Page.captureScreenshot per browser. Supersampling keeps the existing path
-// until browser-pool compatibility is keyed by DPR.
+// Every parallel worker gets its own browser: pages in one browser share six
+// connections to the file server, which a media-heavy page holds (#5548), and
+// sharing also crashes BeginFrame and serializes screenshots.
 export function shouldDisableBrowserPoolForParallelWorker({
   parallel,
-  platform,
-  deviceScaleFactor,
-  headlessShellPath,
 }: WorkerBrowserPoolDecision): boolean {
-  return Boolean(
-    parallel && platform === "linux" && headlessShellPath && (deviceScaleFactor ?? 1) <= 1,
-  );
+  return Boolean(parallel);
 }
 
 export function selectWorkerDiagnostics(
@@ -229,7 +230,7 @@ export function synthesizeSilentWorkerExitError(
     `worker ${result.workerId} exited without terminal error string ` +
     `(framesCaptured=${result.framesCaptured}, expected=${expectedFrames}, ` +
     `range=[${result.startFrame}, ${result.endFrame})). ` +
-    `Field signal ts=1784042064 — this class of failure has been reported; ` +
+    `Field signal ts=1784042064: this class of failure has been reported; ` +
     `consider re-run with --workers=1 to isolate.`
   );
 }
@@ -563,13 +564,16 @@ async function captureFrameRange(
   task: WorkerTask,
   captureOptions: CaptureOptions,
   signal: AbortSignal | undefined,
-  onFrameCaptured: ((workerId: number, frameIndex: number) => void) | undefined,
+  onFrameCaptured:
+    | ((workerId: number, frameIndex: number, landedFrame?: LandedFrame) => void)
+    | undefined,
   onFrameBuffer:
     | ((frameIndex: number, buffer: Buffer, session: CaptureSession) => Promise<void>)
     | undefined,
   phaseTimeoutMs: number,
   diagnosticFor: (phase: ParallelWorkerPhase, frameIndex?: number) => ParallelWorkerPhaseDiagnostic,
   onWorkerPhase: ((diagnostic: ParallelWorkerPhaseDiagnostic) => void) | undefined,
+  onWorkerOperation?: (diagnostic: ParallelWorkerPhaseDiagnostic) => void,
 ): Promise<number> {
   let framesCaptured = 0;
   const outputOffset = task.outputFrameOffset ?? 0;
@@ -579,13 +583,15 @@ async function captureFrameRange(
     frameIndex: number,
     operation: () => Promise<T>,
   ): Promise<T> => {
-    const diagnostic = diagnosticFor(phase, frameIndex);
+    const diagnostic = { ...diagnosticFor(phase, frameIndex), readStep: () => session.captureStep };
     if (framesCaptured === 0) onWorkerPhase?.(diagnostic);
+    onWorkerOperation?.(diagnostic);
     return withParallelWorkerDeadline(operation(), diagnostic, phaseTimeoutMs, signal);
   };
   const awaitEncode = (frameIndex: number, encodeResult: Promise<Buffer>): Promise<Buffer> => {
     const diagnostic = diagnosticFor("frame_encode", frameIndex);
     if (framesCaptured === 0) onWorkerPhase?.(diagnostic);
+    onWorkerOperation?.(diagnostic);
     return withParallelWorkerDeadline(encodeResult, diagnostic, phaseTimeoutMs, signal);
   };
   // Depth-2 pipelined drawElement produce (HF_DE_PARALLEL_STREAM spike): frame
@@ -609,7 +615,7 @@ async function captureFrameRange(
       if (signal?.aborted) throw new Error("Parallel worker cancelled");
       const time = (i * captureOptions.fps.den) / captureOptions.fps.num;
       if (dbg && i < task.startFrame + dbgWin) {
-        console.log(`[par:w${task.workerId}] +${Date.now() - dbgT0}ms produce ${i} start`);
+        console.error(`[par:w${task.workerId}] +${Date.now() - dbgT0}ms produce ${i} start`);
       }
       const { encodeResult } = await runCaptureOperation("frame_capture", i, () =>
         captureFrameToBufferPipelined(session, i - outputOffset, time),
@@ -621,23 +627,25 @@ async function captureFrameRange(
       // and would otherwise surface as an unhandled rejection during teardown.
       encodeResult.catch(() => {});
       if (dbg && i < task.startFrame + dbgWin) {
-        console.log(`[par:w${task.workerId}] +${Date.now() - dbgT0}ms produce ${i} kicked`);
+        console.error(`[par:w${task.workerId}] +${Date.now() - dbgT0}ms produce ${i} kicked`);
       }
       if (prev) {
         if (dbg && prev.idx < task.startFrame + dbgWin) {
-          console.log(
+          console.error(
             `[par:w${task.workerId}] +${Date.now() - dbgT0}ms drain ${prev.idx} await-encode`,
           );
         }
         const buf = await awaitEncode(prev.idx, prev.encodeResult);
         if (dbg && prev.idx < task.startFrame + dbgWin) {
-          console.log(
+          console.error(
             `[par:w${task.workerId}] +${Date.now() - dbgT0}ms drain ${prev.idx} encoded ${buf.length}B`,
           );
         }
         await onFrameBuffer(prev.idx, buf, session);
         if (dbg && prev.idx < task.startFrame + dbgWin) {
-          console.log(`[par:w${task.workerId}] +${Date.now() - dbgT0}ms drain ${prev.idx} written`);
+          console.error(
+            `[par:w${task.workerId}] +${Date.now() - dbgT0}ms drain ${prev.idx} written`,
+          );
         }
         framesCaptured++;
         if (onFrameCaptured) onFrameCaptured(task.workerId, prev.idx);
@@ -656,18 +664,20 @@ async function captureFrameRange(
     const time = (i * captureOptions.fps.den) / captureOptions.fps.num;
     const fileFrameIdx = i - outputOffset;
 
+    let landedFrame: LandedFrame | undefined;
     if (onFrameBuffer) {
       const { buffer } = await runCaptureOperation("frame_capture", i, () =>
         captureFrameToBuffer(session, fileFrameIdx, time),
       );
       await onFrameBuffer(i, buffer, session);
     } else {
-      await runCaptureOperation("frame_capture", i, () =>
+      const { path } = await runCaptureOperation("frame_capture", i, () =>
         captureFrame(session, fileFrameIdx, time),
       );
+      landedFrame = { index: fileFrameIdx, path };
     }
     framesCaptured++;
-    if (onFrameCaptured) onFrameCaptured(task.workerId, i);
+    if (onFrameCaptured) onFrameCaptured(task.workerId, i, landedFrame);
   }
   return framesCaptured;
 }
@@ -710,7 +720,7 @@ export function selectVerifySampleIndicesForTask(
  */
 /** HF_DE_PAR_DEBUG=1 gated per-worker trace line (message built lazily). */
 function logParDebug(message: () => string): void {
-  if (process.env.HF_DE_PAR_DEBUG === "1") console.log(message());
+  if (process.env.HF_DE_PAR_DEBUG === "1") console.error(message());
 }
 
 /**
@@ -732,7 +742,7 @@ function assertDiskSampleAboveFloor(
       { kind: "psnr", frameIndex: idx, failedDb: db, verifyThresholdDb: verifyMinDb },
     );
   }
-  console.log(
+  console.error(
     `[Parallel] drawElement disk self-verify passed (worker ${workerId}, frame ${idx}, ` +
       `${db === Infinity ? "inf" : db.toFixed(1)}dB)`,
   );
@@ -783,7 +793,7 @@ async function psnrForDiskSample(
       const detail = err instanceof Error ? err.message : String(err);
       throw new Error(
         `[Parallel] drawElement disk self-verify aborted (worker ${workerId}, frame ${idx}): ` +
-          `ffmpeg or the \`psnr\` filter is unavailable — ${detail}. The preflight in ` +
+          `ffmpeg or the \`psnr\` filter is unavailable (${detail}). The preflight in ` +
           "initDrawElementOrTransparentBackground normally catches this at bootstrap; if you " +
           "hit this after a successful preflight, ffmpeg was replaced mid-render or " +
           "HYPERFRAMES_FFMPEG_PATH now points at a different binary.",
@@ -835,12 +845,13 @@ async function executeWorkerTask(
   captureOptions: CaptureOptions,
   createBeforeCaptureHook: () => BeforeCaptureHook | null,
   signal?: AbortSignal,
-  onFrameCaptured?: (workerId: number, frameIndex: number) => void,
+  onFrameCaptured?: (workerId: number, frameIndex: number, landedFrame?: LandedFrame) => void,
   onFrameBuffer?: (frameIndex: number, buffer: Buffer, session: CaptureSession) => Promise<void>,
   config?: Partial<EngineConfig>,
   parallel?: boolean,
   onFailure?: (failure: CaptureFailure) => void,
   onWorkerPhase?: (diagnostic: ParallelWorkerPhaseDiagnostic) => void,
+  onWorkerOperation?: (diagnostic: ParallelWorkerPhaseDiagnostic) => void,
 ): Promise<WorkerResult> {
   const startTime = Date.now();
   let framesCaptured = 0;
@@ -850,13 +861,7 @@ async function executeWorkerTask(
   let session: CaptureSession | null = null;
   let perf: CapturePerfSummary | undefined;
 
-  const needsSeparateBrowsers = shouldDisableBrowserPoolForParallelWorker({
-    parallel,
-    platform: process.platform,
-    forceScreenshot: config?.forceScreenshot,
-    deviceScaleFactor: captureOptions.deviceScaleFactor,
-    headlessShellPath: resolveHeadlessShellPath(config),
-  });
+  const needsSeparateBrowsers = shouldDisableBrowserPoolForParallelWorker({ parallel });
   const workerConfig: Partial<EngineConfig> | undefined = needsSeparateBrowsers
     ? { ...config, enableBrowserPool: false }
     : config;
@@ -932,6 +937,7 @@ async function executeWorkerTask(
       phaseTimeoutMs,
       diagnosticFor,
       onWorkerPhase,
+      onWorkerOperation,
     );
 
     await verifyDiskDrawElementSamples(activeSession, task, Boolean(onFrameBuffer));
@@ -945,6 +951,7 @@ async function executeWorkerTask(
       frameStride: task.frameStride,
       durationMs: Date.now() - startTime,
       perf,
+      pageErrorLines: pageErrorLinesOf(activeSession),
     };
   } catch (error) {
     const diagnostics = session ? selectWorkerDiagnostics(session.browserConsoleBuffer) : [];
@@ -958,6 +965,7 @@ async function executeWorkerTask(
     const failure = classifyCaptureFailure(error, {
       signal,
       workerDiagnostics: [workerDiagnostic],
+      pageErrorLines: session ? pageErrorLinesOf(session) : undefined,
     });
     onFailure?.(failure);
     return {
@@ -970,6 +978,7 @@ async function executeWorkerTask(
       perf,
       error: failure.message,
       diagnostics: diagnostics.length > 0 ? diagnostics : undefined,
+      pageErrorLines: session ? pageErrorLinesOf(session) : undefined,
       failure,
     };
   } finally {
@@ -1018,6 +1027,11 @@ export interface ParallelCaptureHooks {
    * frame (the ordered writer) with the original error, not a stall.
    */
   onWorkerFailure?: (failure: CaptureFailure) => void;
+  onWorkerOperation?: (diagnostic: ParallelWorkerPhaseDiagnostic) => void;
+}
+
+function pageErrorLinesOf(session: CaptureSession): string[] {
+  return session.browserConsoleBuffer.filter((line) => line.includes("PAGEERROR"));
 }
 
 /**
@@ -1083,7 +1097,7 @@ export async function executeParallelCapture(
 
   for (const task of tasks) workerProgress.set(task.workerId, 0);
 
-  const onFrameCaptured = (workerId: number, _frameIndex: number) => {
+  const onFrameCaptured = (workerId: number, _frameIndex: number, landedFrame?: LandedFrame) => {
     const current = workerProgress.get(workerId) || 0;
     workerProgress.set(workerId, current + 1);
 
@@ -1094,6 +1108,7 @@ export async function executeParallelCapture(
         capturedFrames,
         activeWorkers: tasks.length,
         workerProgress: new Map(workerProgress),
+        ...(landedFrame && { landedFrame }),
       });
     }
   };
@@ -1115,10 +1130,11 @@ export async function executeParallelCapture(
     captureOptions.deVerifySamples,
     tasks.length,
   );
-  const workerCaptureOptions: CaptureOptions =
-    deVerifySamples === captureOptions.deVerifySamples
-      ? captureOptions
-      : { ...captureOptions, deVerifySamples };
+  const workerCaptureOptions: CaptureOptions = {
+    ...captureOptions,
+    deVerifySamples,
+    deFrameFallback: false,
+  };
   const peerController = new AbortController();
   const workerSignal = signal
     ? AbortSignal.any([signal, peerController.signal])
@@ -1143,6 +1159,7 @@ export async function executeParallelCapture(
         parallel,
         onFailure,
         onWorkerPhase,
+        hooks?.onWorkerOperation,
       ),
     ),
   );
@@ -1160,6 +1177,7 @@ export async function executeParallelCapture(
       message: `[Parallel] Capture failed: ${errorMessages}`,
       cause: representative,
       workerDiagnostics,
+      pageErrorLines: [...new Set(results.flatMap((result) => result.pageErrorLines ?? []))],
     });
   }
 
@@ -1188,7 +1206,7 @@ export async function mergeWorkerFrames(
       const sourcePath = join(task.outputDir, file);
       const targetPath = join(outputDir, file);
       try {
-        await rename(sourcePath, targetPath);
+        await renameWithRetryAsync(sourcePath, targetPath);
       } catch {
         await copyFile(sourcePath, targetPath);
       }

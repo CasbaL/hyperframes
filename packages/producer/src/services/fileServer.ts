@@ -28,6 +28,7 @@ import { Readable } from "node:stream";
 import { join, extname, resolve, sep } from "node:path";
 import { injectScriptsAtHeadStart, injectScriptsIntoHtml } from "@hyperframes/core/compiler";
 import { fpsToNumber, type Fps } from "@hyperframes/core";
+import { stripSdrPngColourTags } from "@hyperframes/core/compiler/png-colour-tags";
 import { getVerifiedHyperframeRuntimeSource } from "./hyperframeRuntimeLoader.js";
 import { getHfEarlyStub } from "../generated/hf-early-stub-inline.js";
 import { defaultLogger, type ProducerLogger } from "../logger.js";
@@ -241,7 +242,7 @@ export function buildVirtualTimeShim(options: VirtualTimeShimOptions): string {
   const seededRandomBlock = seedRandomFromFrame
     ? String.raw`
   // Seeded Math.random / crypto.getRandomValues, keyed by virtual time.
-  // Mulberry32 — single uint32 state, deterministic, fast.
+  // Mulberry32: single uint32 state, deterministic, fast.
   var rngState = 0;
   function mulberry32() {
     rngState |= 0; rngState = (rngState + 0x6D2B79F5) | 0;
@@ -252,7 +253,7 @@ export function buildVirtualTimeShim(options: VirtualTimeShimOptions): string {
   }
   function reseedRngFromTime(ms) {
     var ms32 = Math.max(0, Math.floor(Number(ms) || 0)) | 0;
-    // Knuth's multiplicative hash + golden-ratio offset — gives a well-
+    // Knuth's multiplicative hash + golden-ratio offset gives a well-
     // distributed seed even for frame 0 (otherwise rngState=0 degenerates
     // the PRNG's first few outputs).
     rngState = (Math.imul(ms32, -1640531527) + 0x9E3779B9) | 0;
@@ -518,7 +519,7 @@ function buildRenderModeScript(fps: Fps | undefined): string {
     };
     window.__playerReady = true;
     // Media-fallback player has no timeline to bind, so render-ready is immediate.
-    // init.ts defers __renderReady until the timeline is bound — different runtime.
+    // init.ts defers __renderReady until the timeline is bound (a different runtime).
     window.__renderReady = true;
     return true;
   }
@@ -836,6 +837,19 @@ export function createFileServer(options: FileServerOptions): Promise<FileServer
         return c.text(html, 200, { "Content-Type": contentType });
       }
 
+      if (ext === ".png") {
+        const untagged = stripSdrPngColourTags(await readFileAsync(fd));
+        if (untagged) {
+          const headers = {
+            "Content-Type": contentType,
+            "Content-Length": String(untagged.length),
+          };
+          return new Response(c.req.method === "HEAD" ? null : new Uint8Array(untagged), {
+            headers,
+          });
+        }
+      }
+
       // Stream binary file content rather than buffering it with readFileSync.
       // On video-heavy compositions Chrome requests several 32MB video files
       // back-to-back through this server; each readFileSync(32MB) blocked the
@@ -882,7 +896,8 @@ export function createFileServer(options: FileServerOptions): Promise<FileServer
       const stream = createReadStream(filePath, {
         fd,
         autoClose: true,
-        ...(range ? { start: range.start, end: range.end } : {}),
+        start: range?.start ?? 0,
+        ...(range ? { end: range.end } : {}),
       });
       streamOwnsFd = true;
       try {

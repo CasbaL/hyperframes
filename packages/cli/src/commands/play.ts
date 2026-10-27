@@ -25,6 +25,8 @@ import * as clack from "@clack/prompts";
 import { c } from "../ui/colors.js";
 import { resolveProject, type ProjectDir } from "../utils/project.js";
 import { resolveAutoProxy } from "../utils/projectConfig.js";
+import { normalizeErrorMessage } from "../utils/errorMessage.js";
+import { parsePort } from "../utils/port.js";
 import {
   openBrowser,
   parseRemoteDebuggingPort,
@@ -84,8 +86,15 @@ export default defineCommand({
     },
   },
   async run({ args }) {
+    let startPort: number;
+    try {
+      startPort = parsePort(args.port ?? "3003");
+    } catch (error) {
+      clack.log.error(normalizeErrorMessage(error));
+      setCommandExitCode(1);
+      return;
+    }
     const project = resolveProject(args.dir);
-    const startPort = parseInt(args.port ?? "3003", 10);
 
     // Validation: --user-data-dir requires --browser-path
     if (args["user-data-dir"] && !args["browser-path"]) {
@@ -238,10 +247,11 @@ export async function registerCompositionRoute(
 
     const contentType = assetContentType(filePath);
     // Edited text is caught by a content hash; an mtime tag can repeat for a same-size rewrite.
+    const mediaType = contentType.split(";")[0]!.trim();
     const isText =
-      contentType.startsWith("text/") ||
-      contentType === "application/json" ||
-      contentType === "image/svg+xml";
+      mediaType.startsWith("text/") ||
+      mediaType === "application/json" ||
+      mediaType === "image/svg+xml";
     if (isText && !ctx.req.header("Range")) {
       return revalidatedResponse(
         readFileSync(filePath, "utf-8"),

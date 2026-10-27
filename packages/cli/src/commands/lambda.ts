@@ -11,11 +11,14 @@ import { failCommand } from "../utils/commandResult.js";
 
 import { defineCommand } from "citty";
 import type { DistributedFormat } from "@hyperframes/aws-lambda/sdk";
-import { type CanvasResolution } from "@hyperframes/core";
+import { type CanvasResolution, DISTRIBUTED_FPS, isDistributedFps } from "@hyperframes/core";
 import { parseOutputResolutionFlag } from "../utils/parseOutputResolution.js";
 import type { Example } from "./_examples.js";
+import type { VideoArch } from "./lambda/videoImage.js";
 import { c } from "../ui/colors.js";
-import { readAllowedCompositionFpsFromDir } from "../utils/compositionFps.js";
+import { deliveryFlagArgs, parseDeliveryFlags } from "../utils/deliveryFlags.js";
+import { defaultCloudFps } from "../utils/compositionFps.js";
+import { isMissingPackageError, missingPackageMessage } from "../utils/missingPackage.js";
 
 export const examples: Example[] = [
   ["Deploy the Lambda render stack to AWS", "hyperframes lambda deploy"],
@@ -109,29 +112,59 @@ export default defineCommand({
     profile: { type: "string", description: "AWS profile name (default: AWS_PROFILE env)" },
 
     // deploy
-    concurrency: { type: "string", description: "Lambda reserved concurrency (default: 8)" },
+    concurrency: {
+      type: "string",
+      description:
+        "Lambda reserved concurrency, or none to remove it (default: keep the stack's; a new stack reserves none and each render runs up to 90% of the account's unreserved concurrency)",
+    },
     "chrome-source": {
       type: "string",
       description: "sparticuz | chrome-headless-shell (default: sparticuz)",
     },
     memory: { type: "string", description: "Lambda memory MB (default: 10240)" },
+    "video-arch": {
+      type: "string",
+      description:
+        "arm64 | x86_64: where the plan and chunks run; arm64 adds a container-image function (default: arm64)",
+    },
     "skip-build": { type: "boolean", description: "Reuse existing handler.zip (deploy)" },
+    warm: {
+      type: "boolean",
+      default: true,
+      description: "Warm the video function once after deploy (--no-warm skips it)",
+    },
 
     // sites / render
     "site-id": { type: "string", description: "Explicit site id (overrides content hash)" },
-    width: { type: "string", description: "Render width in pixels" },
-    height: { type: "string", description: "Render height in pixels" },
+    width: {
+      type: "string",
+      description:
+        "Output width in pixels: the composition's width, or a whole-number multiple of it (3840 on a 1920x1080 composition renders at scale 2)",
+    },
+    height: {
+      type: "string",
+      description: "Output height in pixels, at the same multiple as --width",
+    },
     "output-resolution": {
       type: "string",
       description:
         "Output resolution preset that engages Chrome deviceScaleFactor supersampling. Accepts canonical names (landscape, landscape-4k, portrait, portrait-4k, square, square-4k) and aliases (1080p, 4k, uhd, hd). When set, the composition's authored data-width/data-height is supersampled to the target preset without changing the layout.",
     },
-    fps: { type: "string", description: "Render fps (24 | 30 | 60)" },
+    fps: { type: "string", description: `Render fps (${DISTRIBUTED_FPS.join(" | ")})` },
     format: { type: "string", description: "mp4 | mov | png-sequence | webm (default: mp4)" },
     codec: { type: "string", description: "h264 | h265 (mp4 only)" },
     quality: { type: "string", description: "draft | standard | high" },
-    "chunk-size": { type: "string", description: "Frames per chunk (default: 240)" },
-    "max-parallel-chunks": { type: "string", description: "Max concurrent chunks (default: 16)" },
+    ...deliveryFlagArgs,
+    "chunk-size": {
+      type: "string",
+      description:
+        "Frames per chunk (default: sized so each chunk fits the Lambda timeout, one wave across --concurrency)",
+    },
+    "max-parallel-chunks": {
+      type: "string",
+      description:
+        "Max chunks per render (default: one wave across the deploy's --concurrency, widened to fit the Lambda timeout)",
+    },
     "target-chunk-frames": {
       type: "string",
       description:
@@ -217,27 +250,16 @@ export default defineCommand({
     // The lambda subverbs dynamic-import `@hyperframes/aws-lambda` at call
     // time. We keep aws-lambda as a workspace devDependency (not a runtime
     // dep) so the published CLI install stays small for users who don't
-    // deploy to Lambda. Subverbs other than `policies` need aws-lambda;
-    // catch the missing-module error here and turn it into a friendly hint.
-    const verbsNeedingSDK = new Set([
-      "deploy",
-      "sites",
-      "render",
-      "render-batch",
-      "progress",
-      "destroy",
-    ]);
+    // deploy to Lambda. These subverbs need it and get a friendly hint when it
+    // is missing; `deploy` reports that itself and `destroy` needs only SAM.
+    const verbsNeedingSDK = new Set(["sites", "render", "render-batch", "progress"]);
     if (verbsNeedingSDK.has(subcommand)) {
       try {
         await import("@hyperframes/aws-lambda/sdk");
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code === "ERR_MODULE_NOT_FOUND") {
+        if (isMissingPackageError(err, "@hyperframes/aws-lambda")) {
           console.error(
-            `${c.error("@hyperframes/aws-lambda is not installed.")} The ${c.accent(`hyperframes lambda ${subcommand}`)} command needs it at runtime.\n` +
-              `Install it alongside the CLI:\n` +
-              `  ${c.accent("npm install -g @hyperframes/aws-lambda")}\n` +
-              `Or, for an opt-in dev setup:\n` +
-              `  ${c.accent("npm install @hyperframes/aws-lambda")}`,
+            missingPackageMessage("@hyperframes/aws-lambda", `hyperframes lambda ${subcommand}`),
           );
           failCommand();
         }
@@ -248,14 +270,17 @@ export default defineCommand({
     switch (subcommand) {
       case "deploy": {
         const { runDeploy } = await import("./lambda/deploy.js");
+        const { parseReservedConcurrency } = await import("./lambda/sam.js");
         await runDeploy({
           stackName,
           region: args.region as string | undefined,
           awsProfile: args.profile as string | undefined,
-          reservedConcurrency: parsePositiveInt(args.concurrency, "--concurrency"),
+          reservedConcurrency: parseReservedConcurrency(args.concurrency),
           chromeSource: parseChromeSource(args["chrome-source"]),
           lambdaMemoryMb: parsePositiveInt(args.memory, "--memory"),
+          videoArch: parseVideoArch(args["video-arch"]),
           skipBuild: Boolean(args["skip-build"]),
+          warm: args.warm !== false,
         });
         return;
       }
@@ -296,12 +321,11 @@ export default defineCommand({
           console.error("[lambda render] --width and --height are required.");
           failCommand();
         }
-        const fpsRaw =
-          parseIntFlag(args.fps) ??
-          readAllowedCompositionFpsFromDir(projectDir, [24, 30, 60]) ??
-          30;
-        if (fpsRaw !== 24 && fpsRaw !== 30 && fpsRaw !== 60) {
-          console.error(`[lambda render] --fps must be 24, 30, or 60; got ${fpsRaw}.`);
+        const fpsRaw = parseIntFlag(args.fps) ?? defaultCloudFps(projectDir);
+        if (!isDistributedFps(fpsRaw)) {
+          console.error(
+            `[lambda render] --fps must be one of ${DISTRIBUTED_FPS.join(", ")}; got ${fpsRaw}.`,
+          );
           failCommand();
         }
         const { runRender } = await import("./lambda/render.js");
@@ -318,6 +342,7 @@ export default defineCommand({
           format: parseFormat(args.format),
           codec: parseCodec(args.codec),
           quality: parseQuality(args.quality),
+          ...parseDeliveryFlags(args),
           chunkSize: parsePositiveInt(args["chunk-size"], "--chunk-size"),
           maxParallelChunks: parsePositiveInt(args["max-parallel-chunks"], "--max-parallel-chunks"),
           targetChunkFrames: parsePositiveInt(args["target-chunk-frames"], "--target-chunk-frames"),
@@ -353,12 +378,11 @@ export default defineCommand({
           console.error("[lambda render-batch] --width and --height are required.");
           failCommand();
         }
-        const fpsRaw =
-          parseIntFlag(args.fps) ??
-          readAllowedCompositionFpsFromDir(projectDir, [24, 30, 60]) ??
-          30;
-        if (fpsRaw !== 24 && fpsRaw !== 30 && fpsRaw !== 60) {
-          console.error(`[lambda render-batch] --fps must be 24, 30, or 60; got ${fpsRaw}.`);
+        const fpsRaw = parseIntFlag(args.fps) ?? defaultCloudFps(projectDir);
+        if (!isDistributedFps(fpsRaw)) {
+          console.error(
+            `[lambda render-batch] --fps must be one of ${DISTRIBUTED_FPS.join(", ")}; got ${fpsRaw}.`,
+          );
           failCommand();
         }
         const { runRenderBatch } = await import("./lambda/render-batch.js");
@@ -376,6 +400,7 @@ export default defineCommand({
           format: parseFormat(args.format),
           codec: parseCodec(args.codec),
           quality: parseQuality(args.quality),
+          ...parseDeliveryFlags(args),
           chunkSize: parsePositiveInt(args["chunk-size"], "--chunk-size"),
           maxParallelChunks: parsePositiveInt(args["max-parallel-chunks"], "--max-parallel-chunks"),
           targetChunkFrames: parsePositiveInt(args["target-chunk-frames"], "--target-chunk-frames"),
@@ -482,6 +507,9 @@ const parseQuality = (raw: unknown): (typeof QUALITIES)[number] | undefined =>
   parseEnum(raw, QUALITIES, "[lambda render] --quality", undefined);
 const parseChromeSource = (raw: unknown): (typeof CHROME_SOURCES)[number] =>
   parseEnum(raw, CHROME_SOURCES, "[lambda deploy] --chrome-source", "sparticuz")!;
+const VIDEO_ARCHS = ["x86_64", "arm64"] as const satisfies readonly VideoArch[];
+const parseVideoArch = (raw: unknown): (typeof VIDEO_ARCHS)[number] | undefined =>
+  parseEnum(raw, VIDEO_ARCHS, "[lambda deploy] --video-arch", undefined);
 
 /**
  * Lambda flavor of the shared {@link parseOutputResolutionFlag} — same wire

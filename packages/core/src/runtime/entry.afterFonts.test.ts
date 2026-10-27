@@ -4,9 +4,9 @@ import {
   AFTER_FONTS_SCRIPT_TYPE,
   deferScriptsUntilFonts,
 } from "../compiler/scriptRuns";
-import { FONT_WAIT_TIMEOUT_MS } from "./afterFonts";
+import { FONT_WAIT_TIMEOUT_MS, PREVIEW_SCRIPT_SLICE_MS } from "./afterFonts";
 
-type Face = { family: string; status: FontFaceLoadStatus };
+type Face = { family: string; status: FontFaceLoadStatus; load?: () => Promise<unknown> };
 
 // jsdom runs scripts in its own global, so they report through the shared document.
 const logs = (entry: string) =>
@@ -89,6 +89,37 @@ describe("runtime entry: composition scripts after web fonts", () => {
     expect(document.querySelectorAll(`script[type="${AFTER_FONTS_SCRIPT_TYPE}"]`)).toHaveLength(0);
   });
 
+  it.each([
+    [
+      "a preview gives the page a turn once a slice of scripts has run",
+      false,
+      "a in-place turn b ready ",
+    ],
+    [
+      "a render's virtual clock gets no turns, so its scripts run back to back",
+      true,
+      "a in-place b ready ",
+    ],
+  ])("%s", async (_name, rendering, expected) => {
+    const clock = [0, 0, PREVIEW_SCRIPT_SLICE_MS + 1];
+    vi.spyOn(performance, "now").mockImplementation(
+      () => clock.shift() ?? PREVIEW_SCRIPT_SLICE_MS + 1,
+    );
+    const turn = vi.fn(async () => {
+      document.getElementById("log")!.textContent += "turn ";
+    });
+    vi.stubGlobal("scheduler", { yield: turn });
+    if (rendering) vi.stubGlobal("__HF_VIRTUAL_TIME__", {});
+    serveFonts(Promise.resolve(), []);
+    mountDeferredScripts();
+
+    await parseThenLoad();
+    await vi.waitFor(() => expect(window.__player).toBeDefined());
+    expect(log()).toBe(expected);
+    expect(turn).toHaveBeenCalledTimes(rendering ? 0 : 1);
+    vi.unstubAllGlobals();
+  });
+
   it("keeps an addEventListener wrapper a deferred script installs while its load events are held", async () => {
     serveFonts(Promise.resolve(), []);
     document.body.innerHTML =
@@ -130,6 +161,82 @@ describe("runtime entry: composition scripts after web fonts", () => {
       expect(log()).toBe("lib:loaded");
     },
   );
+
+  it("starts loading a declared face no laid-out text uses, so scripts run once it is in", async () => {
+    let fontsLoaded = () => {};
+    let faceLoaded = () => {};
+    const scriptOnly: Face = {
+      family: "Caveat",
+      status: "unloaded",
+      load: vi.fn(() => {
+        scriptOnly.status = "loading";
+        return new Promise<void>((resolve) => (faceLoaded = resolve));
+      }),
+    };
+    const inUse: Face = { family: "Inter", status: "loaded", load: vi.fn() };
+    serveFonts(new Promise<void>((resolve) => (fontsLoaded = resolve)), [scriptOnly, inUse]);
+    mountDeferredScripts();
+
+    await parseThenLoad();
+    await Promise.resolve();
+    expect(scriptOnly.load).toHaveBeenCalledTimes(1);
+    expect(inUse.load).not.toHaveBeenCalled();
+    expect(log()).toBe("");
+
+    faceLoaded();
+    scriptOnly.status = "loaded";
+    fontsLoaded();
+    await vi.waitFor(() => expect(window.__player).toBeDefined());
+    expect(log()).toBe("a in-place b ready ");
+  });
+
+  it("runs the scripts at the timeout when a declared face fails to load or never settles", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
+    const posted = vi.spyOn(window.parent, "postMessage").mockImplementation(() => {});
+    vi.spyOn(console, "warn").mockImplementation(() => {});
+    const missing: Face = {
+      family: "Missing Face",
+      status: "unloaded",
+      load: vi.fn(() => {
+        missing.status = "error";
+        return Promise.reject(new Error("404"));
+      }),
+    };
+    const silent: Face = {
+      family: "Silent Face",
+      status: "unloaded",
+      load: vi.fn(() => {
+        silent.status = "loading";
+        return new Promise(() => {});
+      }),
+    };
+    serveFonts(new Promise(() => {}), [
+      missing,
+      silent,
+      { family: "Hanken Grotesk", status: "loading" },
+    ]);
+    mountDeferredScripts();
+
+    await parseThenLoad();
+    await vi.advanceTimersByTimeAsync(FONT_WAIT_TIMEOUT_MS - 1);
+    expect(missing.load).toHaveBeenCalledTimes(1);
+    expect(silent.load).toHaveBeenCalledTimes(1);
+    expect(log()).toBe("");
+
+    await vi.advanceTimersByTimeAsync(1);
+    expect(log()).toMatch(/^a .*b /);
+    expect(posted).toHaveBeenCalledWith(
+      expect.objectContaining({
+        type: "diagnostic",
+        code: "runtime_font_wait_timeout",
+        details: {
+          loadingFamilies: ["Silent Face", "Hanken Grotesk"],
+          timeoutMs: FONT_WAIT_TIMEOUT_MS,
+        },
+      }),
+      "*",
+    );
+  });
 
   it("runs the scripts at the font timeout and reports the families still loading", async () => {
     vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] });
